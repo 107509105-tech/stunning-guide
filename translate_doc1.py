@@ -1,0 +1,227 @@
+import docx
+from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
+from googletrans import Translator
+import time
+import os
+import re
+import copy
+
+def merge_paragraphs(doc):
+    print("Pre-processing: Merging split paragraphs (Body only)...")
+    # Snapshot of paragraphs
+    paragraphs = list(doc.paragraphs)
+    if not paragraphs:
+        return
+
+    last_p = paragraphs[0]
+    merged_count = 0
+    
+    terminators = ('。', '？', '！', '：', ':', ';', '；', ')', '）', '”', '"')
+    
+    for i in range(1, len(paragraphs)):
+        curr_p = paragraphs[i]
+        text = curr_p.text.strip()
+        last_text = last_p.text.strip()
+        
+        if not text:
+            last_p = curr_p
+            continue
+            
+        if not last_text:
+             last_p = curr_p
+             continue
+             
+        # Check termination of last_p
+        is_terminated = last_text.endswith(terminators)
+        
+        # Check next start (curr_p)
+        starts_with_number = bool(re.match(r'^\s*\d+(\.|$)', text))
+        
+        # Check if last_p looks like a header (Short + Numbered)
+        last_is_header = bool(re.match(r'^\s*\d+(\.|$)', last_text)) and len(last_text) < 40
+        
+        if not is_terminated and not starts_with_number and not last_is_header:
+            # Merge
+            sep = ""
+            if last_text[-1].isascii() and text[0].isascii():
+                sep = " "
+                
+            last_p.text = last_p.text.rstrip() + sep + text.lstrip()
+            
+            try:
+                curr_p._element.getparent().remove(curr_p._element)
+                merged_count += 1
+            except Exception as e:
+                print(f"Error removing paragraph: {e}")
+        else:
+            last_p = curr_p
+            
+    print(f"Merged {merged_count} paragraphs.")
+
+def translate_paragraph_element(p, translator):
+    """
+    Translates a paragraph element (python-docx Paragraph object or wrapper).
+    Inserts the translation as a NEW paragraph following the current one.
+    """
+    text = p.text.strip()
+    if not text:
+        return
+
+    try:
+        # Check for header case (Ends with colon)
+        is_header_colon = text.endswith('\uff1a') or text.endswith(':')
+        text_to_translate = text.rstrip('\uff1a:')
+        
+        # Translate
+        result = translator.translate(text_to_translate, src='zh-cn', dest='en')
+        translated_text = result.text.strip()
+        
+        if is_header_colon:
+            # Inline translation
+            p.text = f"{text_to_translate}({translated_text}):"
+        else:
+            # Insert new paragraph
+            # Strategy: create a new paragraph element in the same parent
+            p_elem = p._element
+            parent = p_elem.getparent()
+            
+            new_p_elem = copy.deepcopy(p_elem)
+            
+            # Clear runs in the copy
+            for child in list(new_p_elem):
+                if child.tag.endswith('r'): # Run
+                     new_p_elem.remove(child)
+            
+            # Create a run element
+            run = docx.oxml.shared.OxmlElement('w:r')
+            t = docx.oxml.shared.OxmlElement('w:t')
+            t.text = translated_text
+            run.append(t)
+            new_p_elem.append(run)
+            
+            # Insert after current p
+            parent.insert(parent.index(p_elem) + 1, new_p_elem)
+            
+    except Exception as e:
+        print(f"  Error translating '{text[:20]}...': {e}")
+
+def translate_and_format(input_path, output_path):
+    print(f"Loading {input_path}...", flush=True)
+    doc = docx.Document(input_path)
+    
+    # 1. Merge Paragraphs (Body)
+    merge_paragraphs(doc)
+    
+    translator = Translator()
+    
+    # helper for processing lists of paragraphs
+    def process_paragraph_list(paragraph_list):
+        # iterate copy
+        for p in list(paragraph_list):
+            if p.text.strip():
+                translate_paragraph_element(p, translator)
+                
+    # 2. Translate Body
+    print("Translating Body...", flush=True)
+    process_paragraph_list(doc.paragraphs)
+    
+    # 3. Translate Headers/Footers
+    print("Translating Headers/Footers...", flush=True)
+    for section in doc.sections:
+        process_paragraph_list(section.header.paragraphs)
+        process_paragraph_list(section.footer.paragraphs)
+                
+    # 4. Translate Tables
+    print("Translating Tables...", flush=True)
+    original_tables = list(doc.tables)
+    
+    for i, table in enumerate(original_tables):
+        print(f"  Processing Table {i}...", flush=True)
+        # Check if flowchart
+        is_flowchart = False
+        
+        # Check for v:stroke joinstyle="milter" in the table XML
+        if '<v:stroke joinstyle="milter"/>' in table._element.xml:
+             is_flowchart = True
+        
+        if is_flowchart:
+            print(f"  Table {i} detected as Flowchart (contains v:stroke). Creating translated copy...", flush=True)
+            
+            parent = table._element.getparent()
+            try:
+                table_index = parent.index(table._element)
+            except ValueError:
+                print("  Could not find table index (maybe nested?). Skipping clone.", flush=True)
+                continue
+            
+            # Insert Page Break
+            pb_p = docx.oxml.shared.OxmlElement('w:p')
+            pb_r = docx.oxml.shared.OxmlElement('w:r')
+            pb_br = docx.oxml.shared.OxmlElement('w:br')
+            pb_br.set(qn('w:type'), 'page')
+            pb_r.append(pb_br)
+            pb_p.append(pb_r)
+            
+            parent.insert(table_index + 1, pb_p)
+            
+            # Insert Copy of Table
+            new_tbl = copy.deepcopy(table._element)
+            parent.insert(table_index + 2, new_tbl)
+            
+            new_table_obj = docx.table.Table(new_tbl, parent)
+            
+            # Translate content of the copy (Replace text)
+            count_cells = 0
+            for row in new_table_obj.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        text = p.text.strip()
+                        if text:
+                            try:
+                                text_to_translate = text.rstrip('\uff1a:')
+                                result = translator.translate(text_to_translate, src='zh-cn', dest='en')
+                                p.text = result.text.strip()
+                            except Exception as e:
+                                print(f"Error translating flowchart cell: {e}", flush=True)
+                    count_cells += 1
+                    if count_cells % 10 == 0:
+                        print(".", end="", flush=True)
+            print(" Done.", flush=True)
+                                
+        else:
+            # Regular table: Interleave
+            print(f"  Interleaving Table {i}...", flush=True)
+            for row in table.rows:
+                for cell in row.cells:
+                    process_paragraph_list(cell.paragraphs)
+            print(" Done.", flush=True)
+
+    # 5. Translate Text Boxes
+    print("Translating Text Boxes...", flush=True)
+    body = doc.element.body
+    count_txbx = 0
+    for txbx in body.iter(qn('w:txbxContent')):
+        count_txbx += 1
+        ps = list(txbx.iter(qn('w:p')))
+        for p_elem in ps:
+            try:
+                p_obj = Paragraph(p_elem, None) 
+                if p_obj.text.strip():
+                     translate_paragraph_element(p_obj, translator)
+            except Exception as e:
+                print(f"  Error in text box p: {e}", flush=True)
+    print(f"Processed {count_txbx} text boxes.", flush=True)
+
+    print(f"Saving to {output_path}...", flush=True)
+    doc.save(output_path)
+    print("Done.", flush=True)
+
+if __name__ == "__main__":
+    input_file = "document_cn2.docx"
+    output_file = "translated_document2.docx"
+    
+    if os.path.exists(input_file):
+        translate_and_format(input_file, output_file)
+    else:
+        print("Input file not found.")
